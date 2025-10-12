@@ -74,7 +74,7 @@ void setup() {
   Serial.print("📡 IP: ");
   Serial.println(WiFi.localIP());
 
-  ArduinoOTA.setPassword("admin");  // 👈 tutaj dodaj hasło
+  ArduinoOTA.setPassword("admin");
   ArduinoOTA.begin();
 
   ThingSpeak.begin(client);
@@ -87,7 +87,7 @@ void setup() {
 
 void loop() {
   wifiMulti.run();
-  ArduinoOTA.handle(); // musi być w pętli!
+  ArduinoOTA.handle();
 
   // 1️⃣ Odczyt z czujnika (ciągły)
   while (mySerial.available() >= 4) {
@@ -132,7 +132,7 @@ void loop() {
       if (avg_cm) {
 
         HTTPClient https;
-        https.begin(httpsClient, ha_url);  // używamy nowego klienta
+        https.begin(httpsClient, ha_url); 
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Authorization", String("Bearer ") + ha_token);
 
