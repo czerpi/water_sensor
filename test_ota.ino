@@ -1,6 +1,7 @@
+// python espota.py -i 192.168.1.34 -p 3232 -f ../Documents/Arduino/test_ota/build/esp32.esp32.esp32da/test_ota.ino.bin -a admin
 #include <WiFi.h>
 #include <WiFiMulti.h>
-#include <Preferences.h>
+#include <EEPROM.h>
 #include <ThingSpeak.h>
 #include <ArduinoOTA.h>
 #include <HardwareSerial.h>
@@ -8,14 +9,42 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
+#define EEPROM_SIZE 1024
+
+// EEPROM helper functions
+String readStringFromEEPROM(int addr) {
+  String value = "";
+  char ch;
+  for (int i = 0; i < 64; i++) {
+    ch = EEPROM.read(addr + i);
+    if (ch == 0) break;
+    value += ch;
+  }
+  return value;
+}
+
+void saveStringToEEPROM(int addr, const String& data) {
+  int len = data.length();
+  for (int i = 0; i < 64; i++) {
+    if (i < len) {
+      EEPROM.write(addr + i, data[i]);
+    } else {
+      EEPROM.write(addr + i, 0);
+    }
+  }
+  EEPROM.commit();
+}
+
+
 #define RXD2 16
 #define TXD2 17
 
 // ======= KONFIGURACJA =======
-#define WINDOW_SIZE 100          // liczba pomiarów do uśredniania
+#define WINDOW_SIZE 40          // liczba pomiarów do uśredniania
+#define MIN_SAMPLES 20  // Minimalna liczba próbek, żeby liczyć i wysyłać
 #define SEND_INTERVAL 60000      // co ile wysyłać dane (ms) — 1 minuta
 #define RESTART_INTERVAL 86400000 // restart po 24h (ms)
-#define TO_ZERO_LEVEL 250 // odleglosc do dna   
+#define TO_ZERO_LEVEL 237 // odleglosc do dna   
 
 uint16_t samples[WINDOW_SIZE];
 int sampleIndex = 0;
@@ -29,11 +58,10 @@ String ha_url;
 String ha_token;
 int channel;
 
-// ======= ZMIENNE =======
 HardwareSerial mySerial(1);
-
 WiFiMulti wifiMulti;
-Preferences prefs;
+
+
 WiFiClient client;
 WiFiClientSecure httpsClient;
 
@@ -41,23 +69,30 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // zapis
-  prefs.begin("config", false);
-  // prefs.putString("ha_url", "");
-  // prefs.putString("ha_token", "");
-  prefs.end();
+  // EEPROM initialization for both ESP32 and ESP8266
+  // EEPROM.begin(EEPROM_SIZE);
+  // // ⚠️ Only run once to save your config
+  // saveStringToEEPROM(0, "Elion_1B11");
+  // saveStringToEEPROM(64, "25808A0DE0866");
+  // saveStringToEEPROM(128, "12345678");
+  // saveStringToEEPROM(192, "B0mb0w012345678");
+  // saveStringToEEPROM(256, "https://6bb29091fb4a625ddf4eb8296097bdc1.czerpak.pl/api/states/sensor.water_level");
+  // saveStringToEEPROM(512, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJmMTY4MjBkYzUyZTk0NWUwYjFhYjIyNjE0MWY4ZmQ1OSIsImlhdCI6MTc2MDI1NDU5NiwiZXhwIjoyMDc1NjE0NTk2fQ.0YmItXQNccBBpeWlfqmJomy4X5FGnZYP7YIOtxGq-Qg");
+  // saveStringToEEPROM(768, "A4Y84M4MKLTNPXWI");
+  // EEPROM.write(960, 3108182);
+  // EEPROM.commit();
 
-  // 📡 Odczyt z NVS
-  prefs.begin("config", true);
-  String ssid1 = prefs.getString("ssid1", "");
-  String pass1 = prefs.getString("pass1", "");
-  String ssid2 = prefs.getString("ssid2", "");
-  String pass2 = prefs.getString("pass2", "");
-  ha_url = prefs.getString("ha_url", "");
-  ha_token = prefs.getString("ha_token", "");
-  apiKey = prefs.getString("ts_api", "");
-  channel = prefs.getInt("ts_channel", 0);
-  prefs.end();
+  // Serial.println("✅ Saved EEPROM settings!");
+
+  // Read credentials from EEPROM
+  String ssid1 = readStringFromEEPROM(0);
+  String pass1 = readStringFromEEPROM(64);
+  String ssid2 = readStringFromEEPROM(128);
+  String pass2 = readStringFromEEPROM(192);
+  ha_url = readStringFromEEPROM(256);
+  ha_token = readStringFromEEPROM(512);
+  apiKey = readStringFromEEPROM(768);
+  channel = EEPROM.read(960);
 
   // 📶 Dodaj sieci do WiFiMulti
   if (ssid1.length() > 0) wifiMulti.addAP(ssid1.c_str(), pass1.c_str());
@@ -90,13 +125,20 @@ void loop() {
   ArduinoOTA.handle();
 
   // 1️⃣ Odczyt z czujnika (ciągły)
-  while (mySerial.available() >= 4) {
+  Stream &serialPort = mySerial;
+
+  while (serialPort.available() >= 4) {
     uint8_t buf[4];
-    mySerial.readBytes(buf, 4);
+    serialPort.readBytes(buf, 4);
     if (buf[0] == 0xFF) {
       uint16_t distance = (buf[1] << 8) | buf[2];
       uint8_t checksum = (buf[0] + buf[1] + buf[2]) & 0xFF;
       if (checksum == buf[3]) {
+
+        // ⛔️ Ignoruj pomiary < 30 cm lub > 230 cm 
+        if (distance < 300 || distance > 2300 ) {
+          continue;
+        }
         samples[sampleIndex] = distance;
         sampleIndex++;
         if (sampleIndex >= WINDOW_SIZE) {
@@ -105,7 +147,7 @@ void loop() {
         }
       }
     } else {
-      mySerial.read(); // zły bajt
+      serialPort.read(); // zły bajt
     }
   }
 
@@ -114,7 +156,7 @@ void loop() {
     lastSend = millis();
 
     int count = bufferFull ? WINDOW_SIZE : sampleIndex;
-    if (count > 0) {
+    if (count >= MIN_SAMPLES) {
       uint32_t sum = 0;
       for (int i = 0; i < count; i++) sum += samples[i];
       float avg_cm = TO_ZERO_LEVEL - ((sum / (float)count) / 10.0);  // mm → cm
