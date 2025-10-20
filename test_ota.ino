@@ -1,4 +1,5 @@
 // python espota.py -i 192.168.1.34 -p 3232 -f ../Documents/Arduino/test_ota/build/esp32.esp32.esp32da/test_ota.ino.bin -a admin
+#include <stdlib.h>  // potrzebne do qsort
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <EEPROM.h>
@@ -157,12 +158,25 @@ void loop() {
 
     int count = bufferFull ? WINDOW_SIZE : sampleIndex;
     if (count >= MIN_SAMPLES) {
-      uint32_t sum = 0;
-      for (int i = 0; i < count; i++) sum += samples[i];
-      float avg_cm = TO_ZERO_LEVEL - ((sum / (float)count) / 10.0);  // mm → cm
-      Serial.println(avg_cm);
+      // Oblicz medianę z próbek
+      uint16_t sorted[WINDOW_SIZE];
+      for (int i = 0; i < count; i++) sorted[i] = samples[i];
+      // Funkcja porównująca do qsort
+      auto cmp_uint16 = [](const void* a, const void* b) -> int {
+        uint16_t aa = *(const uint16_t*)a, bb = *(const uint16_t*)b;
+        return (aa > bb) - (aa < bb);
+      };
+      qsort(sorted, count, sizeof(uint16_t), cmp_uint16);
+      float median_mm;
+      if (count % 2 == 0) {
+        median_mm = (sorted[count/2 - 1] + sorted[count/2]) / 2.0;
+      } else {
+        median_mm = sorted[count/2];
+      }
+      float median_cm = TO_ZERO_LEVEL - (median_mm / 10.0);  // mm → cm
+      Serial.println(median_cm);
       // send to thingspeak
-      ThingSpeak.setField(1, avg_cm);
+      ThingSpeak.setField(1, median_cm);
       int code = ThingSpeak.writeFields(channel, apiKey.c_str());
       if (code == 200) {
         Serial.println("✅ Dane wysłane do ThingSpeak!");
@@ -171,14 +185,13 @@ void loop() {
       }
 
       //send to home assistant
-      if (avg_cm) {
-
+      if (median_cm) {
         HTTPClient https;
         https.begin(httpsClient, ha_url); 
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Authorization", String("Bearer ") + ha_token);
 
-        String payload = "{\"state\": \"" + String(avg_cm) + "\", \"attributes\": {\"unit_of_measurement\": \"cm\"}}";
+        String payload = "{\"state\": \"" + String(median_cm) + "\", \"attributes\": {\"unit_of_measurement\": \"cm\"}}";
 
         int httpCode = https.POST(payload);
 
