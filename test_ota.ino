@@ -45,7 +45,7 @@ void saveStringToEEPROM(int addr, const String& data) {
 
 // ======= KONFIGURACJA =======
 #define WINDOW_SIZE 40          // liczba pomiarów do uśredniania
-#define MIN_SAMPLES 20  // Minimalna liczba próbek, żeby liczyć i wysyłać
+#define MIN_SAMPLES 3  // Minimalna liczba próbek, żeby liczyć i wysyłać
 #define SEND_INTERVAL 60000      // co ile wysyłać dane (ms) — 1 minuta
 #define RESTART_INTERVAL 86400000 // restart po 24h (ms)
 #define TO_ZERO_LEVEL 237 // odleglosc do dna   
@@ -181,6 +181,9 @@ void loop() {
       Serial.println(median_cm);
       // send to thingspeak
       ThingSpeak.setField(1, median_cm);
+      ThingSpeak.setField(2, WiFi.RSSI());
+      ThingSpeak.setField(3, ESP.getFreeHeap());
+      ThingSpeak.setField(4, millis() / 1000); // uptime w sekundach
       int code = ThingSpeak.writeFields(channel, apiKey.c_str());
       if (code == 200) {
         Serial.println("✅ Dane wysłane do ThingSpeak!");
@@ -218,5 +221,4 @@ void loop() {
     ESP.restart();
   }
 
-  delay(5);
 }
