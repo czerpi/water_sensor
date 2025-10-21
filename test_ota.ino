@@ -14,14 +14,17 @@
 
 // EEPROM helper functions
 String readStringFromEEPROM(int addr) {
-  String value = "";
-  char ch;
+  char buffer[65]; // 64 + 1 na null-terminator
   for (int i = 0; i < 64; i++) {
-    ch = EEPROM.read(addr + i);
-    if (ch == 0) break;
-    value += ch;
+    char ch = EEPROM.read(addr + i);
+    if (ch == 0) {
+      buffer[i] = '\0';
+      break;
+    }
+    buffer[i] = ch;
   }
-  return value;
+  buffer[64] = '\0'; // zabezpieczenie, gdyby nie było wcześniejszego zera
+  return String(buffer);
 }
 
 void saveStringToEEPROM(int addr, const String& data) {
@@ -65,6 +68,7 @@ WiFiMulti wifiMulti;
 
 WiFiClient client;
 WiFiClientSecure httpsClient;
+HTTPClient https;
 
 void setup() {
   Serial.begin(115200);
@@ -186,22 +190,25 @@ void loop() {
 
       //send to home assistant
       if (median_cm) {
-        HTTPClient https;
-        https.begin(httpsClient, ha_url); 
-        https.addHeader("Content-Type", "application/json");
-        https.addHeader("Authorization", String("Bearer ") + ha_token);
+        bool started = https.begin(httpsClient, ha_url);
+        if (started) {
+          https.addHeader("Content-Type", "application/json");
+          https.addHeader("Authorization", String("Bearer ") + ha_token);
 
-        String payload = "{\"state\": \"" + String(median_cm) + "\", \"attributes\": {\"unit_of_measurement\": \"cm\"}}";
+          String payload = "{\"state\": \"" + String(median_cm) + "\", \"attributes\": {\"unit_of_measurement\": \"cm\"}}";
 
-        int httpCode = https.POST(payload);
+          int httpCode = https.POST(payload);
 
-        if (httpCode > 0) {
-          Serial.printf("📤 Wysłano do Home Assistant! Odpowiedź: %d\n", httpCode);
+          if (httpCode > 0) {
+            Serial.printf("📤 Wysłano do Home Assistant! Odpowiedź: %d\n", httpCode);
+          } else {
+            Serial.printf("❌ Błąd wysyłania: %s\n", https.errorToString(httpCode).c_str());
+          }
+
+          https.end();
         } else {
-          Serial.printf("❌ Błąd wysyłania: %s\n", https.errorToString(httpCode).c_str());
+          Serial.println("❌ Nie udało się zainicjować połączenia HTTPS z Home Assistant.");
         }
-
-        https.end();
       }
     }
   }
