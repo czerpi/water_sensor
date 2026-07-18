@@ -40,19 +40,18 @@ void saveStringToEEPROM(int addr, const String& data) {
 }
 
 
+
 #define RXD2 16
 #define TXD2 17
 
+// Definicja pinu trybu pracy (MODE_PIN)
+#define MODE_PIN 4  // Możesz zmienić numer GPIO na pasujący
+
 // ======= KONFIGURACJA =======
-#define WINDOW_SIZE 40          // liczba pomiarów do uśredniania
 #define MIN_SAMPLES 3  // Minimalna liczba próbek, żeby liczyć i wysyłać
 #define SEND_INTERVAL 60000      // co ile wysyłać dane (ms) — 1 minuta
 #define RESTART_INTERVAL 86400000 // restart po 24h (ms)
 #define TO_ZERO_LEVEL 237 // odleglosc do dna   
-
-uint16_t samples[WINDOW_SIZE];
-int sampleIndex = 0;
-bool bufferFull = false;
 
 unsigned long lastSend = 0;
 unsigned long startTime = 0;
@@ -73,6 +72,10 @@ HTTPClient https;
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Ustawienie pinu trybu pracy — HIGH = tryb przetworzony, LOW = real-time
+  pinMode(MODE_PIN, OUTPUT);
+  digitalWrite(MODE_PIN, HIGH); // HIGH = tryb przetworzony
 
   // EEPROM initialization for both ESP32 and ESP8266
   // EEPROM.begin(EEPROM_SIZE);
@@ -100,8 +103,8 @@ void setup() {
   channel = EEPROM.read(960);
 
   // 📶 Dodaj sieci do WiFiMulti
-  if (ssid1.length() > 0) wifiMulti.addAP(ssid1.c_str(), pass1.c_str());
-  if (ssid2.length() > 0) wifiMulti.addAP(ssid2.c_str(), pass2.c_str());
+  wifiMulti.addAP(ssid1.c_str(), pass1.c_str());
+  wifiMulti.addAP(ssid2.c_str(), pass2.c_str());
 
   Serial.println("📶 Łączenie z jedną z zapisanych sieci...");
   while (wifiMulti.run() != WL_CONNECTED) {
@@ -118,6 +121,7 @@ void setup() {
   ArduinoOTA.begin();
 
   ThingSpeak.begin(client);
+  client.setTimeout(5000);  // Timeout dla ThingSpeak
   mySerial.begin(9600, SERIAL_8N1, RXD2, TXD2);
 
   httpsClient.setInsecure();
@@ -129,61 +133,55 @@ void loop() {
   wifiMulti.run();
   ArduinoOTA.handle();
 
-  // 1️⃣ Odczyt z czujnika (ciągły)
-  Stream &serialPort = mySerial;
-
-  while (serialPort.available() >= 4) {
-    uint8_t buf[4];
-    serialPort.readBytes(buf, 4);
-    if (buf[0] == 0xFF) {
-      uint16_t distance = (buf[1] << 8) | buf[2];
-      uint8_t checksum = (buf[0] + buf[1] + buf[2]) & 0xFF;
-      if (checksum == buf[3]) {
-
-        // ⛔️ Ignoruj pomiary < 30 cm lub > 230 cm 
-        if (distance < 300 || distance > 2300 ) {
-          continue;
-        }
-        samples[sampleIndex] = distance;
-        sampleIndex++;
-        if (sampleIndex >= WINDOW_SIZE) {
-          sampleIndex = 0;
-          bufferFull = true;
-        }
-      }
-    } else {
-      serialPort.read(); // zły bajt
-    }
-  }
-
-  // 2️⃣ Co 1 minutę: licz średnią i wysyłaj
   if (millis() - lastSend >= SEND_INTERVAL) {
     lastSend = millis();
 
-    int count = bufferFull ? WINDOW_SIZE : sampleIndex;
-    if (count >= MIN_SAMPLES) {
+    const int requiredSamples = 5;
+    uint16_t validMeasurements[requiredSamples];
+    int collected = 0;
+    unsigned long startCollection = millis();
+
+    while (collected < requiredSamples && (millis() - startCollection) < SEND_INTERVAL) {
+      if (mySerial.available() >= 4) {
+        uint8_t buf[4];
+        mySerial.readBytes(buf, 4);
+        if (buf[0] == 0xFF) {
+          uint16_t distance = (buf[1] << 8) | buf[2];
+          uint8_t checksum = (buf[0] + buf[1] + buf[2]) & 0xFF;
+          if (checksum == buf[3]) {
+            if (distance >= 300 && distance <= 2300) {
+              validMeasurements[collected++] = distance;
+            }
+          }
+        } else {
+          mySerial.read(); // zły bajt
+        }
+      }
+    }
+
+    if (collected >= MIN_SAMPLES) {
       // Oblicz medianę z próbek
-      uint16_t sorted[WINDOW_SIZE];
-      for (int i = 0; i < count; i++) sorted[i] = samples[i];
+      uint16_t sorted[requiredSamples];
+      for (int i = 0; i < collected; i++) sorted[i] = validMeasurements[i];
       // Funkcja porównująca do qsort
       auto cmp_uint16 = [](const void* a, const void* b) -> int {
         uint16_t aa = *(const uint16_t*)a, bb = *(const uint16_t*)b;
         return (aa > bb) - (aa < bb);
       };
-      qsort(sorted, count, sizeof(uint16_t), cmp_uint16);
+      qsort(sorted, collected, sizeof(uint16_t), cmp_uint16);
       float median_mm;
-      if (count % 2 == 0) {
-        median_mm = (sorted[count/2 - 1] + sorted[count/2]) / 2.0;
+      if (collected % 2 == 0) {
+        median_mm = (sorted[collected/2 - 1] + sorted[collected/2]) / 2.0;
       } else {
-        median_mm = sorted[count/2];
+        median_mm = sorted[collected/2];
       }
       float median_cm = TO_ZERO_LEVEL - (median_mm / 10.0);  // mm → cm
       Serial.println(median_cm);
       // send to thingspeak
       ThingSpeak.setField(1, median_cm);
       ThingSpeak.setField(2, WiFi.RSSI());
-      ThingSpeak.setField(3, ESP.getFreeHeap());
-      ThingSpeak.setField(4, millis() / 1000); // uptime w sekundach
+      ThingSpeak.setField(3, (long)ESP.getFreeHeap());
+      ThingSpeak.setField(4, (long)(millis() / 1000));  // uptime w sekundach
       int code = ThingSpeak.writeFields(channel, apiKey.c_str());
       if (code == 200) {
         Serial.println("✅ Dane wysłane do ThingSpeak!");
@@ -195,6 +193,7 @@ void loop() {
       if (median_cm) {
         bool started = https.begin(httpsClient, ha_url);
         if (started) {
+          https.setTimeout(5000);  // ⏱️ ustawienie timeoutu (5s)
           https.addHeader("Content-Type", "application/json");
           https.addHeader("Authorization", String("Bearer ") + ha_token);
 
