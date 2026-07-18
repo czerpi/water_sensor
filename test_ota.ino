@@ -12,24 +12,35 @@
 
 #define EEPROM_SIZE 1024
 
+#define SSID1_ADDR 0
+#define PASS1_ADDR 64
+#define SSID2_ADDR 128
+#define PASS2_ADDR 192
+#define HA_URL_ADDR 256
+#define HA_TOKEN_ADDR 512
+#define API_KEY_ADDR 768
+#define CHANNEL_ADDR 960
+
+#define SHORT_FIELD_SIZE 64
+#define LONG_FIELD_SIZE 256
+
 // EEPROM helper functions
-String readStringFromEEPROM(int addr) {
-  char buffer[65]; // 64 + 1 na null-terminator
-  for (int i = 0; i < 64; i++) {
-    char ch = EEPROM.read(addr + i);
-    if (ch == 0) {
-      buffer[i] = '\0';
+String readStringFromEEPROM(int addr, int maxLen) {
+  String result;
+  result.reserve(maxLen);
+  for (int i = 0; i < maxLen; i++) {
+    uint8_t value = EEPROM.read(addr + i);
+    if (value == 0 || value == 0xFF) {
       break;
     }
-    buffer[i] = ch;
+    result += (char)value;
   }
-  buffer[64] = '\0'; // zabezpieczenie, gdyby nie było wcześniejszego zera
-  return String(buffer);
+  return result;
 }
 
-void saveStringToEEPROM(int addr, const String& data) {
+void saveStringToEEPROM(int addr, const String& data, int maxLen) {
   int len = data.length();
-  for (int i = 0; i < 64; i++) {
+  for (int i = 0; i < maxLen; i++) {
     if (i < len) {
       EEPROM.write(addr + i, data[i]);
     } else {
@@ -51,7 +62,11 @@ void saveStringToEEPROM(int addr, const String& data) {
 #define MIN_SAMPLES 3  // Minimalna liczba próbek, żeby liczyć i wysyłać
 #define SEND_INTERVAL 60000      // co ile wysyłać dane (ms) — 1 minuta
 #define RESTART_INTERVAL 86400000 // restart po 24h (ms)
+#define WIFI_CONNECT_TIMEOUT 30000 // maksymalny czas laczenia z Wi-Fi (ms)
 #define TO_ZERO_LEVEL 237 // odleglosc do dna   
+#define REQUIRED_SAMPLES 5
+#define SENSOR_MIN_MM 300
+#define SENSOR_MAX_MM 2300
 
 unsigned long lastSend = 0;
 unsigned long startTime = 0;
@@ -59,7 +74,10 @@ unsigned long startTime = 0;
 String apiKey;
 String ha_url;
 String ha_token;
-int channel;
+unsigned long channel;
+
+uint16_t validMeasurements[REQUIRED_SAMPLES];
+int collected = 0;
 
 HardwareSerial mySerial(1);
 WiFiMulti wifiMulti;
@@ -68,6 +86,90 @@ WiFiMulti wifiMulti;
 WiFiClient client;
 WiFiClientSecure httpsClient;
 HTTPClient https;
+
+bool readDistanceFrame(uint16_t &distance) {
+  static uint8_t frame[4];
+  static int pos = 0;
+
+  while (mySerial.available() > 0) {
+    uint8_t byteRead = mySerial.read();
+
+    if (pos == 0 && byteRead != 0xFF) {
+      continue;
+    }
+
+    frame[pos++] = byteRead;
+
+    if (pos == 4) {
+      pos = 0;
+      uint8_t checksum = (frame[0] + frame[1] + frame[2]) & 0xFF;
+      if (checksum == frame[3]) {
+        distance = (frame[1] << 8) | frame[2];
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+float calculateMedianCm() {
+  uint16_t sorted[REQUIRED_SAMPLES];
+  for (int i = 0; i < collected; i++) sorted[i] = validMeasurements[i];
+
+  auto cmp_uint16 = [](const void* a, const void* b) -> int {
+    uint16_t aa = *(const uint16_t*)a, bb = *(const uint16_t*)b;
+    return (aa > bb) - (aa < bb);
+  };
+  qsort(sorted, collected, sizeof(uint16_t), cmp_uint16);
+
+  float median_mm;
+  if (collected % 2 == 0) {
+    median_mm = (sorted[collected / 2 - 1] + sorted[collected / 2]) / 2.0;
+  } else {
+    median_mm = sorted[collected / 2];
+  }
+
+  return TO_ZERO_LEVEL - (median_mm / 10.0);  // mm -> cm
+}
+
+void sendMeasurements(float median_cm) {
+  Serial.println(median_cm);
+
+  // send to thingspeak
+  ThingSpeak.setField(1, median_cm);
+  ThingSpeak.setField(2, WiFi.RSSI());
+  ThingSpeak.setField(3, (long)ESP.getFreeHeap());
+  ThingSpeak.setField(4, (long)(millis() / 1000));  // uptime w sekundach
+  int code = ThingSpeak.writeFields(channel, apiKey.c_str());
+  if (code == 200) {
+    Serial.println("✅ Dane wysłane do ThingSpeak!");
+  } else {
+    Serial.printf("❌ Błąd: %d\n", code);
+  }
+
+  //send to home assistant
+  bool started = https.begin(httpsClient, ha_url);
+  if (started) {
+    https.setTimeout(5000);  // ⏱️ ustawienie timeoutu (5s)
+    https.addHeader("Content-Type", "application/json");
+    https.addHeader("Authorization", String("Bearer ") + ha_token);
+
+    String payload = "{\"state\": \"" + String(median_cm) + "\", \"attributes\": {\"unit_of_measurement\": \"cm\"}}";
+
+    int httpCode = https.POST(payload);
+
+    if (httpCode > 0) {
+      Serial.printf("📤 Wysłano do Home Assistant! Odpowiedź: %d\n", httpCode);
+    } else {
+      Serial.printf("❌ Błąd wysyłania: %s\n", https.errorToString(httpCode).c_str());
+    }
+
+    https.end();
+  } else {
+    Serial.println("❌ Nie udało się zainicjować połączenia HTTPS z Home Assistant.");
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -78,38 +180,45 @@ void setup() {
   digitalWrite(MODE_PIN, HIGH); // HIGH = tryb przetworzony
 
   // EEPROM initialization for both ESP32 and ESP8266
-  // EEPROM.begin(EEPROM_SIZE);
+  EEPROM.begin(EEPROM_SIZE);
   // // ⚠️ Only run once to save your config
-  // saveStringToEEPROM(0, "Elion_1B11");
-  // saveStringToEEPROM(64, "25808A0DE0866");
-  // saveStringToEEPROM(128, "12345678");
-  // saveStringToEEPROM(192, "B0mb0w012345678");
-  // saveStringToEEPROM(256, "https://6bb29091fb4a625ddf4eb8296097bdc1.czerpak.pl/api/states/sensor.water_level");
-  // saveStringToEEPROM(512, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJmMTY4MjBkYzUyZTk0NWUwYjFhYjIyNjE0MWY4ZmQ1OSIsImlhdCI6MTc2MDI1NDU5NiwiZXhwIjoyMDc1NjE0NTk2fQ.0YmItXQNccBBpeWlfqmJomy4X5FGnZYP7YIOtxGq-Qg");
-  // saveStringToEEPROM(768, "A4Y84M4MKLTNPXWI");
-  // EEPROM.write(960, 3108182);
+  // saveStringToEEPROM(SSID1_ADDR, "Elion_1B11", SHORT_FIELD_SIZE);
+  // saveStringToEEPROM(PASS1_ADDR, "25808A0DE0866", SHORT_FIELD_SIZE);
+  // saveStringToEEPROM(SSID2_ADDR, "12345678", SHORT_FIELD_SIZE);
+  // saveStringToEEPROM(PASS2_ADDR, "B0mb0w012345678", SHORT_FIELD_SIZE);
+  // saveStringToEEPROM(HA_URL_ADDR, "https://6bb29091fb4a625ddf4eb8296097bdc1.czerpak.pl/api/states/sensor.water_level", LONG_FIELD_SIZE);
+  // saveStringToEEPROM(HA_TOKEN_ADDR, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJmMTY4MjBkYzUyZTk0NWUwYjFhYjIyNjE0MWY4ZmQ1OSIsImlhdCI6MTc2MDI1NDU5NiwiZXhwIjoyMDc1NjE0NTk2fQ.0YmItXQNccBBpeWlfqmJomy4X5FGnZYP7YIOtxGq-Qg", LONG_FIELD_SIZE);
+  // saveStringToEEPROM(API_KEY_ADDR, "A4Y84M4MKLTNPXWI", SHORT_FIELD_SIZE);
+  // channel = 3108182;
+  // EEPROM.put(CHANNEL_ADDR, channel);
   // EEPROM.commit();
 
   // Serial.println("✅ Saved EEPROM settings!");
 
   // Read credentials from EEPROM
-  String ssid1 = readStringFromEEPROM(0);
-  String pass1 = readStringFromEEPROM(64);
-  String ssid2 = readStringFromEEPROM(128);
-  String pass2 = readStringFromEEPROM(192);
-  ha_url = readStringFromEEPROM(256);
-  ha_token = readStringFromEEPROM(512);
-  apiKey = readStringFromEEPROM(768);
-  channel = EEPROM.read(960);
+  String ssid1 = readStringFromEEPROM(SSID1_ADDR, SHORT_FIELD_SIZE);
+  String pass1 = readStringFromEEPROM(PASS1_ADDR, SHORT_FIELD_SIZE);
+  String ssid2 = readStringFromEEPROM(SSID2_ADDR, SHORT_FIELD_SIZE);
+  String pass2 = readStringFromEEPROM(PASS2_ADDR, SHORT_FIELD_SIZE);
+  ha_url = readStringFromEEPROM(HA_URL_ADDR, LONG_FIELD_SIZE);
+  ha_token = readStringFromEEPROM(HA_TOKEN_ADDR, LONG_FIELD_SIZE);
+  apiKey = readStringFromEEPROM(API_KEY_ADDR, SHORT_FIELD_SIZE);
+  EEPROM.get(CHANNEL_ADDR, channel);
 
   // 📶 Dodaj sieci do WiFiMulti
   wifiMulti.addAP(ssid1.c_str(), pass1.c_str());
   wifiMulti.addAP(ssid2.c_str(), pass2.c_str());
 
   Serial.println("📶 Łączenie z jedną z zapisanych sieci...");
-  while (wifiMulti.run() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (wifiMulti.run() != WL_CONNECTED && (millis() - wifiStart) < WIFI_CONNECT_TIMEOUT) {
     delay(500);
     Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n❌ Nie udało się połączyć z Wi-Fi. Restart...");
+    ESP.restart();
   }
 
   Serial.println("\n✅ Połączono z Wi-Fi:");
@@ -133,86 +242,21 @@ void loop() {
   wifiMulti.run();
   ArduinoOTA.handle();
 
+  uint16_t distance;
+  while (collected < REQUIRED_SAMPLES && readDistanceFrame(distance)) {
+    if (distance >= SENSOR_MIN_MM && distance <= SENSOR_MAX_MM) {
+      validMeasurements[collected++] = distance;
+    }
+  }
+
   if (millis() - lastSend >= SEND_INTERVAL) {
     lastSend = millis();
-
-    const int requiredSamples = 5;
-    uint16_t validMeasurements[requiredSamples];
-    int collected = 0;
-    unsigned long startCollection = millis();
-
-    while (collected < requiredSamples && (millis() - startCollection) < SEND_INTERVAL) {
-      if (mySerial.available() >= 4) {
-        uint8_t buf[4];
-        mySerial.readBytes(buf, 4);
-        if (buf[0] == 0xFF) {
-          uint16_t distance = (buf[1] << 8) | buf[2];
-          uint8_t checksum = (buf[0] + buf[1] + buf[2]) & 0xFF;
-          if (checksum == buf[3]) {
-            if (distance >= 300 && distance <= 2300) {
-              validMeasurements[collected++] = distance;
-            }
-          }
-        } else {
-          mySerial.read(); // zły bajt
-        }
-      }
-    }
-
     if (collected >= MIN_SAMPLES) {
-      // Oblicz medianę z próbek
-      uint16_t sorted[requiredSamples];
-      for (int i = 0; i < collected; i++) sorted[i] = validMeasurements[i];
-      // Funkcja porównująca do qsort
-      auto cmp_uint16 = [](const void* a, const void* b) -> int {
-        uint16_t aa = *(const uint16_t*)a, bb = *(const uint16_t*)b;
-        return (aa > bb) - (aa < bb);
-      };
-      qsort(sorted, collected, sizeof(uint16_t), cmp_uint16);
-      float median_mm;
-      if (collected % 2 == 0) {
-        median_mm = (sorted[collected/2 - 1] + sorted[collected/2]) / 2.0;
-      } else {
-        median_mm = sorted[collected/2];
-      }
-      float median_cm = TO_ZERO_LEVEL - (median_mm / 10.0);  // mm → cm
-      Serial.println(median_cm);
-      // send to thingspeak
-      ThingSpeak.setField(1, median_cm);
-      ThingSpeak.setField(2, WiFi.RSSI());
-      ThingSpeak.setField(3, (long)ESP.getFreeHeap());
-      ThingSpeak.setField(4, (long)(millis() / 1000));  // uptime w sekundach
-      int code = ThingSpeak.writeFields(channel, apiKey.c_str());
-      if (code == 200) {
-        Serial.println("✅ Dane wysłane do ThingSpeak!");
-      } else {
-        Serial.printf("❌ Błąd: %d\n", code);
-      }
-
-      //send to home assistant
-      if (median_cm) {
-        bool started = https.begin(httpsClient, ha_url);
-        if (started) {
-          https.setTimeout(5000);  // ⏱️ ustawienie timeoutu (5s)
-          https.addHeader("Content-Type", "application/json");
-          https.addHeader("Authorization", String("Bearer ") + ha_token);
-
-          String payload = "{\"state\": \"" + String(median_cm) + "\", \"attributes\": {\"unit_of_measurement\": \"cm\"}}";
-
-          int httpCode = https.POST(payload);
-
-          if (httpCode > 0) {
-            Serial.printf("📤 Wysłano do Home Assistant! Odpowiedź: %d\n", httpCode);
-          } else {
-            Serial.printf("❌ Błąd wysyłania: %s\n", https.errorToString(httpCode).c_str());
-          }
-
-          https.end();
-        } else {
-          Serial.println("❌ Nie udało się zainicjować połączenia HTTPS z Home Assistant.");
-        }
-      }
+      sendMeasurements(calculateMedianCm());
+    } else {
+      Serial.println("❌ Za mało poprawnych próbek do wysłania.");
     }
+    collected = 0;
   }
 
   // 3️⃣ Automatyczny restart co 24h
